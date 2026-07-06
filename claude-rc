@@ -1,0 +1,963 @@
+#!/usr/bin/env bash
+#
+# claude-rc — Claude Code の Remote Control を「フォルダ単位」でまとめて管理するツール
+#
+#   list    : SCAN_DIRS を走査し、各フォルダの Git / CLAUDE.md の有無を一覧化
+#             （同時に Claude Code に渡せる inventory.md を書き出す）
+#   start   : ACTIVE_DIRS を、フォルダごとに remote-control サーバーとして一括起動
+#   status  : 起動中サーバーの状態（稼働中 / 停止 / 未起動）と接続URLを端末から確認
+#   watch   : status を一定間隔で更新表示（macOS に watch コマンドが無くても動作）
+#   stop    : 全サーバーを停止
+#   attach  : 専用 tmux セッションにアタッチして実際の画面を覗く
+#
+# 設定ファイル: ~/.config/claude-rc/config.sh （初回実行時に自動生成）
+#
+# 専用 tmux ソケット(-L claude-rc)で動くため、普段使いの tmux とは干渉しません。
+# bash 3.2（macOS 標準）でも動作します。
+set -eo pipefail
+
+# 呼び出し元の PATH に依存しないよう、標準的な bin を先頭に足す。
+# （SwiftBar の bash= クリック・cron・launchd・痩せたシェル等から呼ばれても
+#   tmux / git / gh / claude を確実に見つけられるようにするため。既存 PATH は後ろに温存）
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin:$HOME/bin:$PATH"
+
+CONFIG_DIR="${CLAUDE_RC_HOME:-$HOME/.config/claude-rc}"
+CONFIG_FILE="$CONFIG_DIR/config.sh"
+INVENTORY_FILE="$CONFIG_DIR/inventory.md"
+TMUX_SESSION="claude-rc"
+# 固定パスのソケットで動かす。-L は $TMPDIR 依存でターミナルと launchd で別ソケットに
+# なり得るため、-S で絶対パスに固定し、端末でも launchd でも必ず同じ tmux を共有する。
+TMUX_SOCK="$CONFIG_DIR/claude-rc.sock"
+
+# claude-rc 専用の tmux サーバー（固定ソケットで分離）
+tm() { tmux -S "$TMUX_SOCK" "$@"; }
+
+# ---- 端末が色対応のときだけ色を使う ----
+if [ -t 1 ]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[32m'; C_RED=$'\033[31m'; C_YELLOW=$'\033[33m'
+else
+  C_RESET=; C_DIM=; C_BOLD=; C_GREEN=; C_RED=; C_YELLOW=
+fi
+
+die() { echo "${C_RED}エラー:${C_RESET} $*" >&2; exit 1; }
+need_tmux() {
+  command -v tmux >/dev/null 2>&1 \
+    || die "tmux が必要です。macOS なら 'brew install tmux' で導入してください。"
+}
+
+# ---- 初回起動時に既定の設定ファイルを生成 ----
+ensure_config() {
+  [ -f "$CONFIG_FILE" ] && return 0
+  mkdir -p "$CONFIG_DIR"
+  cat > "$CONFIG_FILE" <<'EOF'
+# claude-rc 設定ファイル（そのまま bash として読み込まれます）
+
+# [list でスキャンする親ディレクトリ]
+# ここ直下の各サブフォルダを「プロジェクト候補」として調べます。
+SCAN_DIRS=(
+  "$HOME/dev"
+)
+
+# [start で実際に remote-control を立ち上げるプロジェクト（フルパス）]
+# 常駐させたい “アクティブな” ものだけを列挙してください。
+# （触っていない大量のプロジェクトはここに入れず、必要時に起動 or Dispatch 推奨）
+ACTIVE_DIRS=(
+  # "$HOME/dev/projectA"
+  # "$HOME/dev/projectB"
+)
+
+# [起動時スタッガー秒数（任意）]
+# start は ACTIVE_DIRS を1台ずつ起動します。台数が多いと claude.ai への
+# 登録が一斉に走り、429（レート制限）で一部サーバーが落ちることがあります。
+# それを避けるため、2台目以降の起動前にこの秒数だけ待ちます（既定 2 秒、0 で無効）。
+# START_STAGGER_SECS=2
+
+# [権限モード（任意・スマホ操作の承認タップ削減）]
+# 既定はスマホ側で毎回「承認」が要る（最も安全）。緩めたい場合に設定:
+#   acceptEdits       … ファイル編集だけ自動承認（Bash 等はなお確認）
+#   bypassPermissions … 全部自動承認＝タップ皆無（便利だが安全網が外れる・要判断）
+# RC_PERMISSION_MODE=acceptEdits
+
+# [詳細デバッグログ（任意）]
+# 1 にすると各サーバーの詳細ログを ~/.config/claude-rc/logs/<名前>.log に残す（冗長・既定オフ）。
+# 通常はクラッシュ時の死因のみ <名前>.crash.log に自動退避されるので 0 のままで十分。
+# RC_DEBUG_LOG=0
+
+# [GitHubリポ自動紐付け（既定オン）]
+# start 時、各 ACTIVE フォルダに private GitHub リポが無ければ作成して origin に紐付ける
+# （既にあればスキップ／.gitignore 雛形で .env 等は除外）。0 で無効化。
+# RC_AUTO_REPO=1
+EOF
+  echo "${C_YELLOW}設定ファイルを作成しました:${C_RESET} $CONFIG_FILE"
+  echo "SCAN_DIRS / ACTIVE_DIRS を編集してから、もう一度実行してください。"
+}
+
+load_config() {
+  ensure_config
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+}
+
+# ---- ヘルパー ----
+strip_slash() { printf '%s' "${1%/}"; }
+
+# tmux のウィンドウ名に使えるよう、フォルダ名をサニタイズ
+project_name() {
+  local b; b="$(basename "$1")"        # $(...) が末尾改行を除去
+  # 英数 ._- 以外をダッシュ化 → 連続ダッシュを1つに圧縮 → 先頭/末尾の - _ を除去
+  # LC_ALL=C 固定でロケール非依存にする（UTF-8 シェルだと [:alnum:] が日本語を英数扱いし、
+  # 同じフォルダでも算出名が変わって start と status が食い違う＝「稼働中なのに未起動」誤判定の元）
+  b="$(printf '%s' "$b" | LC_ALL=C tr -c '[:alnum:]._-' '-' | LC_ALL=C tr -s '-' | LC_ALL=C sed 's/^[-_]*//; s/[-_]*$//')"
+  [ -n "$b" ] || b="project"           # 全部除去されたときの保険
+  printf '%s' "$b"
+}
+
+# 指定パスが ACTIVE_DIRS に含まれるか
+# macOS は大小区別なしFSなので比較も大小無視（ASCIIのみ小文字化・LC_ALL=Cで日本語は不変）。
+# これが無いと Code/Pokemon と code/Pokemon が別物扱いになり重複登録される。
+# さらに日本語名は NFC/NFD（例:「プ」の合成/分解）の違いでもすり抜けるため、
+# iconv UTF-8-MAC で NFD に正規化してから比較する（AIマチアプ写真の二重登録の実例あり）。
+_lc() {
+  local s="$1" n
+  n="$(printf '%s' "$s" | iconv -f UTF-8 -t UTF-8-MAC 2>/dev/null)" || n=""
+  [ -n "$n" ] || n="$s"
+  printf '%s' "$n" | LC_ALL=C tr '[:upper:]' '[:lower:]'
+}
+is_active() {
+  local q d; q="$(_lc "$(strip_slash "$1")")"
+  for d in "${ACTIVE_DIRS[@]}"; do
+    [ -n "$d" ] || continue
+    [ "$(_lc "$(strip_slash "$d")")" = "$q" ] && return 0
+  done
+  return 1
+}
+
+# 表示名（project_name）から ACTIVE_DIRS のパスを引く。見つかればパス出力＋0、無ければ1。
+resolve_dir() {
+  local q="$1" d
+  for d in "${ACTIVE_DIRS[@]}"; do
+    [ -n "$d" ] || continue
+    [ "$(project_name "$d")" = "$q" ] && { strip_slash "$d"; return 0; }
+  done
+  return 1
+}
+
+ensure_session() {
+  if ! tm has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tm new-session -d -s "$TMUX_SESSION" -n "__base__"
+    # 専用ソケットなので -g で安全。プロセス終了後もペインを残し、状態/エラーを読めるように
+    tm set-option -g remain-on-exit on >/dev/null
+  fi
+}
+
+window_exists() {
+  # "--" でオプション終端（先頭がダッシュの名前を grep がオプション誤認するのを防ぐ）
+  tm list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -Fxq -- "$1"
+}
+
+# pane_dead=1 は終了済み、0 は稼働中
+pane_alive() {
+  local dead
+  dead="$(tm list-panes -t "$TMUX_SESSION:$1" -F '#{pane_dead}' 2>/dev/null | head -n1)"
+  [ "$dead" = "0" ]
+}
+
+# ペイン出力から claude.ai のセッションURLを拾う（-J で折返し行を結合し、長いURLの途切れを防ぐ）
+capture_url() {
+  tm capture-pane -t "$TMUX_SESSION:$1" -p -J 2>/dev/null \
+    | grep -oE 'https://claude\.ai[^[:space:]]*' | tail -n1 || true
+}
+
+# ペインの最終行（空行・tmux の dead バナーを除く）を 60 文字まで
+capture_last() {
+  tm capture-pane -t "$TMUX_SESSION:$1" -p -J 2>/dev/null \
+    | grep -v '^[[:space:]]*$' | grep -v 'Pane is dead' \
+    | tail -n1 | cut -c1-60 || true
+}
+
+# ---- フォルダを private GitHub リポに紐付ける（冪等・非致命）----
+# 既に origin(github) があれば何もしない。秘密漏洩を避けるため .gitignore 雛形を先に置く。
+ensure_repo() {
+  local dir="$1" name url
+  [ -d "$dir" ] || return 0
+  command -v git >/dev/null 2>&1 || return 0
+  if url="$(git -C "$dir" remote get-url origin 2>/dev/null)" && printf '%s' "$url" | grep -qi github; then
+    return 0   # 既に紐付け済み
+  fi
+  command -v gh >/dev/null 2>&1 || { echo "${C_YELLOW}repo:${C_RESET} gh 未導入のため紐付けスキップ ($dir)"; return 0; }
+  echo "${C_DIM}repo: private リポを用意中…${C_RESET} $(basename "$dir")"
+  [ -e "$dir/.git" ] || git -C "$dir" init -q -b main || true
+  if [ ! -f "$dir/.gitignore" ]; then
+    cat > "$dir/.gitignore" <<'GI'
+# secrets / env
+.env
+.env.*
+*.pem
+*.key
+*.p8
+id_rsa*
+# deps / build
+node_modules/
+dist/
+build/
+.next/
+.venv/
+venv/
+__pycache__/
+*.pyc
+# os / editor
+.DS_Store
+*.log
+.idea/
+.vscode/
+GI
+  fi
+  git -C "$dir" add -A 2>/dev/null || true
+  if ! git -C "$dir" rev-parse --verify HEAD >/dev/null 2>&1; then
+    git -C "$dir" commit -q --allow-empty -m "Initial commit (claude-rc)" 2>/dev/null || true
+  elif ! git -C "$dir" diff --cached --quiet 2>/dev/null; then
+    git -C "$dir" commit -q -m "Add files (claude-rc)" 2>/dev/null || true
+  fi
+  name="$(project_name "$dir")"
+  if gh repo create "$name" --private --source="$dir" --remote=origin --push >/dev/null 2>&1; then
+    echo "${C_GREEN}repo: 作成・紐付け${C_RESET} $name → $(git -C "$dir" remote get-url origin 2>/dev/null)"
+  else
+    echo "${C_YELLOW}repo: 自動作成に失敗${C_RESET} $name（同名既存/権限/サイズ等）。手動: ${C_BOLD}gh repo create $name --private --source='$dir' --push${C_RESET}"
+  fi
+  return 0
+}
+
+# ====================================================================
+# list : 一覧 + inventory.md 出力
+# ====================================================================
+cmd_list() {
+  load_config
+  mkdir -p "$CONFIG_DIR"
+
+  {
+    echo "# Claude Code プロジェクト一覧"
+    echo
+    echo "_生成: $(date '+%Y-%m-%d %H:%M')  /  claude-rc list_"
+    echo
+    echo "| プロジェクト | パス | Git | CLAUDE.md | 常駐対象 |"
+    echo "|---|---|:--:|---|:--:|"
+  } > "$INVENTORY_FILE"
+
+  printf "%-22s %-5s %-12s %-7s %s\n" "PROJECT" "GIT" "CLAUDE.md" "ACTIVE" "PATH"
+  printf '%s\n' "----------------------------------------------------------------------------"
+
+  local found=0 base sub name git_mark cmd_mark cmd_path active_mark
+  for base in "${SCAN_DIRS[@]}"; do
+    [ -n "$base" ] || continue
+    if [ ! -d "$base" ]; then
+      echo "${C_YELLOW}(スキャン対象なし: $base)${C_RESET}"
+      continue
+    fi
+    for sub in "$base"/*/; do
+      [ -d "$sub" ] || continue
+      sub="${sub%/}"
+      name="$(basename "$sub")"
+
+      if [ -e "$sub/.git" ]; then git_mark="yes"; else git_mark="-"; fi
+
+      if   [ -f "$sub/CLAUDE.md" ];         then cmd_mark="root";    cmd_path="CLAUDE.md"
+      elif [ -f "$sub/.claude/CLAUDE.md" ]; then cmd_mark=".claude"; cmd_path=".claude/CLAUDE.md"
+      else cmd_mark="-"; cmd_path="-"; fi
+
+      # Git でも CLAUDE.md でもないフォルダは雑多なものとみなし除外
+      [ "$git_mark" = "-" ] && [ "$cmd_mark" = "-" ] && continue
+
+      if is_active "$sub"; then active_mark="yes"; else active_mark="-"; fi
+      found=$((found + 1))
+
+      printf "%-22s %-5s %-12s %-7s %s\n" "$name" "$git_mark" "$cmd_mark" "$active_mark" "$sub"
+      echo "| $name | \`$sub\` | $git_mark | $cmd_path | $active_mark |" >> "$INVENTORY_FILE"
+    done
+  done
+
+  echo
+  if [ "$found" -eq 0 ]; then
+    echo "${C_YELLOW}Git/CLAUDE.md を持つフォルダが見つかりませんでした。${C_RESET}"
+    echo "SCAN_DIRS を $CONFIG_FILE で見直してください。"
+  else
+    echo "計 ${C_BOLD}${found}${C_RESET} 件。インベントリを書き出しました: ${C_BOLD}$INVENTORY_FILE${C_RESET}"
+    echo "→ Claude Code に渡すには、セッション内で ${C_BOLD}@$INVENTORY_FILE${C_RESET} と参照、または上表を貼り付け。"
+  fi
+}
+
+# ====================================================================
+# start : ACTIVE_DIRS を一括起動
+# ====================================================================
+cmd_start() {
+  load_config
+  need_tmux
+  local CLAUDE_BIN; CLAUDE_BIN="$(command -v claude || true)"
+  [ -n "$CLAUDE_BIN" ] || die "claude コマンドが見つかりません。Claude Code を導入し PATH を通してください。"
+
+  [ "${#ACTIVE_DIRS[@]}" -gt 0 ] \
+    || die "ACTIVE_DIRS が空です。$CONFIG_FILE に常駐対象を追加してください。"
+
+  # 対象を決定：引数があればその1プロジェクトだけ、無ければ ACTIVE_DIRS 全部
+  local targets=()
+  if [ -n "${1:-}" ]; then
+    local one; one="$(resolve_dir "$1")" \
+      || die "'$1' は ACTIVE_DIRS にありません。'$(basename "$0") status' で表示名を確認してください。"
+    targets=("$one")
+  else
+    targets=("${ACTIVE_DIRS[@]}")
+  fi
+
+  ensure_session
+  mkdir -p "$CONFIG_DIR/logs"
+
+  local dir name target rc_cmd rc_logfile started=0 skipped=0
+  for dir in "${targets[@]}"; do
+    [ -n "$dir" ] || continue
+    if [ ! -d "$dir" ]; then
+      echo "${C_YELLOW}スキップ:${C_RESET} 存在しないフォルダ $dir"
+      continue
+    fi
+    # 任意：RC_AUTO_REPO=1 のときだけ private GitHubリポを作成・紐付け（既定オフ＝自動pushしない＝安全）
+    if [ "${RC_AUTO_REPO:-0}" = "1" ]; then ensure_repo "$dir"; fi
+    name="$(project_name "$dir")"
+    target="$TMUX_SESSION:$name"
+    # --spawn=same-dir を明示して、初回の対話プロンプト（same-dir/worktree 選択）でハングするのを防ぐ。
+    # RC_DEBUG_LOG=1 のとき各サーバーの詳細 debug ログを残す（任意・既定オフ＝冗長で増えるため）。
+    # 通常の死因確認は下の crash 退避（respawn 時）で軽量に永続化するので、これで十分。
+    rc_logfile="$CONFIG_DIR/logs/$name.log"
+    rc_cmd="'$CLAUDE_BIN' remote-control --name '$name' --spawn=same-dir"
+    # 承認フリクション削減（任意）。RC_PERMISSION_MODE を設定するとその権限モードで起動。
+    # 例: acceptEdits=編集のみ自動承認 / bypassPermissions=全自動（タップ皆無だが安全網が外れる）。
+    [ -n "${RC_PERMISSION_MODE:-}" ] && rc_cmd="$rc_cmd --permission-mode '$RC_PERMISSION_MODE'"
+    [ "${RC_DEBUG_LOG:-0}" = "1" ] && rc_cmd="$rc_cmd --debug-file '$rc_logfile'"
+
+    # 稼働中ならスキップ
+    if window_exists "$name" && pane_alive "$name"; then
+      echo "${C_DIM}既に稼働中:${C_RESET} $name"
+      skipped=$((skipped + 1))
+      continue
+    fi
+
+    # ここから先は必ず起動する。2台目以降は、claude.ai への登録が一斉に走って
+    # 429（レート制限）で一部が落ちるのを避けるため、起動前に間隔を空ける。
+    if [ "$started" -gt 0 ] && [ "${START_STAGGER_SECS:-2}" -gt 0 ]; then
+      sleep "${START_STAGGER_SECS:-2}"
+    fi
+
+    if window_exists "$name"; then
+      # 死んだペインの最終出力を crash ログへ退避してから再起動（self-heal 後も死因を残す）
+      {
+        echo "----- crash captured $(date '+%Y-%m-%d %H:%M:%S') -----"
+        tm capture-pane -t "$target" -p -J -S -200 2>/dev/null \
+          | grep -v '^[[:space:]]*$' | grep -v 'Pane is dead' | tail -n 40
+        echo
+      } >> "$CONFIG_DIR/logs/$name.crash.log" 2>/dev/null || true
+      tm respawn-window -k -t "$target" -c "$dir" "$rc_cmd"
+      echo "${C_GREEN}再起動:${C_RESET} $name"
+    else
+      tm new-window -t "$TMUX_SESSION" -n "$name" -c "$dir" "$rc_cmd"
+      echo "${C_GREEN}起動:${C_RESET}   $name  ${C_DIM}($dir)${C_RESET}"
+    fi
+    started=$((started + 1))
+  done
+
+  if window_exists "__base__" && [ "$(tm list-windows -t "$TMUX_SESSION" | wc -l)" -gt 1 ]; then
+    tm kill-window -t "$TMUX_SESSION:__base__" 2>/dev/null || true
+  fi
+
+  echo
+  echo "起動 ${started} 件 / スキップ ${skipped} 件。  状態確認 → ${C_BOLD}$(basename "$0") status${C_RESET}"
+}
+
+# ====================================================================
+# status : 各サーバーの状態を端末から確認
+# ====================================================================
+cmd_status() {
+  load_config
+  need_tmux
+
+  if ! tm has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "tmux セッション '$TMUX_SESSION' は未起動です。  '$(basename "$0") start' で開始できます。"
+    return 0
+  fi
+
+  printf "  %-22s %-8s %s\n" "PROJECT" "STATE" "URL / 最終状態"
+  printf "  %s\n" "------------------------------------------------------------------------"
+
+  if [ "${#ACTIVE_DIRS[@]}" -eq 0 ]; then
+    echo "  (ACTIVE_DIRS が空です)"
+    return 0
+  fi
+
+  local dir name dot state info
+  for dir in "${ACTIVE_DIRS[@]}"; do
+    [ -n "$dir" ] || continue
+    name="$(project_name "$dir")"
+
+    if ! window_exists "$name"; then
+      dot="${C_DIM}○${C_RESET}"; state="未起動"; info="-"
+    elif pane_alive "$name"; then
+      dot="${C_GREEN}●${C_RESET}"; state="稼働中"
+      info="$(capture_url "$name")"
+      [ -n "$info" ] || info="$(capture_last "$name")"
+      [ -n "$info" ] || info="(起動中… URL 待ち)"
+    else
+      dot="${C_RED}●${C_RESET}"; state="停止"
+      info="$(capture_last "$name")"
+      [ -n "$info" ] || info="プロセス終了（'attach' で詳細確認）"
+    fi
+    printf "%b %-22s %-8s %s\n" "$dot" "$name" "$state" "$info"
+  done
+}
+
+# ====================================================================
+# watch : status を定期更新（watch コマンド不要）
+# ====================================================================
+# 間隔文字列を秒数に変換。単位: s=秒 / m=分 / h=時間 / 無印=秒。例: 1s 30s 5m 1h
+# 標準出力に「秒数 表示ラベル」を出す。不正なら 1 を返す。
+parse_interval() {
+  local in="$1" num unit secs
+  case "$in" in
+    *[sS]) num="${in%[sS]}"; unit="s" ;;
+    *[mM]) num="${in%[mM]}"; unit="m" ;;
+    *[hH]) num="${in%[hH]}"; unit="h" ;;
+    *)     num="$in";        unit="s" ;;   # 無印は秒
+  esac
+  case "$num" in
+    ''|*[!0-9]*) return 1 ;;               # 数字以外は不正
+  esac
+  [ "$num" -gt 0 ] 2>/dev/null || return 1
+  case "$unit" in
+    s) secs="$num";              printf '%s %s秒ごと'   "$secs" "$num" ;;
+    m) secs="$((num*60))";       printf '%s %s分ごと'   "$secs" "$num" ;;
+    h) secs="$((num*3600))";     printf '%s %s時間ごと' "$secs" "$num" ;;
+  esac
+}
+
+cmd_watch() {
+  local raw="${1:-3}" parsed secs label
+  parsed="$(parse_interval "$raw")" || die "間隔の指定が不正です: '$raw'（例: 1s / 30s / 5m / 1h / 数字のみ=秒）"
+  secs="${parsed%% *}"; label="${parsed#* }"
+  trap 'echo; exit 0' INT
+  while true; do
+    clear 2>/dev/null || printf '\033[H\033[2J'   # TERM未設定でも落ちないように（set -e 対策）
+    echo "${C_BOLD}claude-rc status${C_RESET}   ($(date '+%H:%M:%S'))   ${C_DIM}Ctrl-C で終了 / ${label}更新${C_RESET}"
+    echo
+    cmd_status
+    sleep "$secs"
+  done
+}
+
+cmd_stop() {
+  need_tmux
+  if ! tm has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    echo "起動中のセッションはありません。"
+    return 0
+  fi
+  # 引数があればそのプロジェクトだけ停止、無ければ全停止
+  if [ -n "${1:-}" ]; then
+    load_config
+    local one name; one="$(resolve_dir "$1")" || die "'$1' は ACTIVE_DIRS にありません。"
+    name="$(project_name "$one")"
+    if window_exists "$name"; then
+      tm kill-window -t "$TMUX_SESSION:$name"
+      echo "停止しました: $name"
+    else
+      echo "起動していません: $name"
+    fi
+  else
+    tm kill-session -t "$TMUX_SESSION"
+    echo "全停止しました（tmux セッション '$TMUX_SESSION' を終了）。"
+  fi
+  echo "${C_DIM}※ 自己修復(launchd)が有効だと5分以内に復活します。恒久停止は先に '$(basename "$0") pause'。${C_RESET}"
+}
+
+cmd_restart() {
+  load_config
+  need_tmux
+  [ -n "${1:-}" ] || die "使い方: $(basename "$0") restart <プロジェクト名>"
+  local one name; one="$(resolve_dir "$1")" \
+    || die "'$1' は ACTIVE_DIRS にありません。'$(basename "$0") status' で表示名を確認してください。"
+  name="$(project_name "$one")"
+  if tm has-session -t "$TMUX_SESSION" 2>/dev/null && window_exists "$name"; then
+    tm kill-window -t "$TMUX_SESSION:$name" 2>/dev/null || true
+  fi
+  cmd_start "$1"
+}
+
+# 自己修復（launchd の start エージェント）の plist を探す
+agent_plist() { ls "$HOME/Library/LaunchAgents/"*claude-rc*start*.plist 2>/dev/null | head -n1 || true; }
+
+cmd_pause() {
+  local plist; plist="$(agent_plist)"
+  [ -n "$plist" ] || die "自動起動エージェントが見つかりません（launchd 未導入）。"
+  if launchctl bootout "gui/$(id -u)" "$plist" 2>/dev/null; then
+    echo "自己修復を一時停止しました。これで '$(basename "$0") stop' が復活せず効きます。"
+  else
+    echo "${C_DIM}既に停止中のようです。${C_RESET}"
+  fi
+  echo "再開: $(basename "$0") resume"
+}
+
+cmd_resume() {
+  local plist; plist="$(agent_plist)"
+  [ -n "$plist" ] || die "自動起動エージェントが見つかりません（launchd 未導入）。"
+  if launchctl bootstrap "gui/$(id -u)" "$plist" 2>/dev/null; then
+    echo "自己修復を再開しました（ログイン時起動＋5分ごと復活が有効）。"
+  else
+    echo "${C_DIM}既に有効のようです。${C_RESET}"
+  fi
+}
+
+cmd_add() {
+  load_config
+  local norepo=0
+  if [ "${1:-}" = "--no-repo" ]; then norepo=1; shift; fi
+  [ -n "${1:-}" ] || die "使い方: $(basename "$0") add [--no-repo] <フォルダパス>"
+  local dir; dir="$(cd "$1" 2>/dev/null && pwd)" || die "フォルダが見つかりません: $1"
+  [ "$norepo" = "1" ] || ensure_repo "$dir"
+  if is_active "$dir"; then
+    echo "${C_DIM}既に常駐対象です:${C_RESET} $dir"
+  else
+    printf 'ACTIVE_DIRS+=("%s")\n' "$dir" >> "$CONFIG_FILE"
+    echo "${C_GREEN}常駐対象に追加:${C_RESET} $dir"
+  fi
+  cmd_start "$(project_name "$dir")"
+}
+
+# ====================================================================
+# GUI 連携（SwiftBar など）向けの機能群
+# ====================================================================
+
+# recent : 直近使用したフォルダを新しい順に列挙（~/.claude/projects の mtime + jsonl内 cwd）
+#   recent [N]              人間向け（既定10）
+#   recent [N] --porcelain  GUI向け TSV: <実パス>\t<表示名>\t<稼働中0/1>
+cmd_recent() {
+  need_tmux
+  local n=10 porcelain=0 a
+  for a in "$@"; do
+    case "$a" in
+      --porcelain) porcelain=1 ;;
+      *[!0-9]*|'') : ;;
+      *) n="$a" ;;
+    esac
+  done
+  local projdir="$HOME/.claude/projects"
+  [ -d "$projdir" ] || { [ "$porcelain" = 1 ] || echo "(~/.claude/projects が見つかりません)"; return 0; }
+  local has_sess=0
+  tm has-session -t "$TMUX_SESSION" 2>/dev/null && has_sess=1
+  local count=0 seen=" " d jsonl cwd name running
+  while IFS= read -r d; do
+    [ -n "$d" ] || continue
+    jsonl="$(ls -t "$d"*.jsonl 2>/dev/null | head -1)"
+    [ -n "$jsonl" ] || continue
+    cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$jsonl" 2>/dev/null | head -1 | sed 's/.*"cwd":"//; s/"$//')"
+    [ -n "$cwd" ] && [ -d "$cwd" ] || continue
+    case "$seen" in *"|$cwd|"*) continue ;; esac   # 同一フォルダの重複を除外
+    seen="$seen|$cwd|"
+    name="$(project_name "$cwd")"
+    running=0
+    if [ "$has_sess" = 1 ] && window_exists "$name" && pane_alive "$name"; then running=1; fi
+    if [ "$porcelain" = 1 ]; then
+      printf '%s\t%s\t%s\n' "$cwd" "$name" "$running"
+    else
+      [ "$running" = 1 ] && printf "  ${C_GREEN}●${C_RESET} %-20s %s\n" "$name" "$cwd" \
+                         || printf "  ${C_DIM}○${C_RESET} %-20s %s\n" "$name" "$cwd"
+    fi
+    count=$((count + 1))
+    [ "$count" -ge "$n" ] && break
+  done < <(ls -dt "$projdir"/*/ 2>/dev/null)
+}
+
+# json : GUI 用の機械可読状態（TSV: <表示名>\t<状態 on/dead/off>\t<URL>）
+#        ACTIVE_DIRS と実在する tmux 窓の和集合を出す
+cmd_json() {
+  load_config
+  need_tmux
+  tm has-session -t "$TMUX_SESSION" 2>/dev/null || return 0
+  local names=() dir w nm state url seen=" "
+  for dir in "${ACTIVE_DIRS[@]}"; do [ -n "$dir" ] && names+=("$(project_name "$dir")"); done
+  while IFS= read -r w; do [ "$w" = "__base__" ] && continue; [ -n "$w" ] && names+=("$w"); done \
+    < <(tm list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null)
+  for nm in "${names[@]}"; do
+    case "$seen" in *" $nm "*) continue ;; esac
+    seen="$seen$nm "
+    if ! window_exists "$nm"; then state="off"; url=""
+    elif pane_alive "$nm"; then state="on"; url="$(capture_url "$nm")"
+    else state="dead"; url=""; fi
+    printf '%s\t%s\t%s\n' "$nm" "$state" "$url"
+  done
+}
+
+# 単一フォルダ用の remote-control 起動（ACTIVE_DIRS には永続追加しない・トグル用）
+_rc_start_dir() {
+  local dir="$1" CLAUDE_BIN name rc_cmd
+  CLAUDE_BIN="$(command -v claude || true)"
+  [ -n "$CLAUDE_BIN" ] || die "claude コマンドが見つかりません。"
+  ensure_session
+  mkdir -p "$CONFIG_DIR/logs"
+  name="$(project_name "$dir")"
+  if window_exists "$name" && pane_alive "$name"; then echo "${C_DIM}既に稼働中:${C_RESET} $name"; return 0; fi
+  rc_cmd="'$CLAUDE_BIN' remote-control --name '$name' --spawn=same-dir"
+  [ -n "${RC_PERMISSION_MODE:-}" ] && rc_cmd="$rc_cmd --permission-mode '$RC_PERMISSION_MODE'"
+  [ "${RC_DEBUG_LOG:-0}" = "1" ] && rc_cmd="$rc_cmd --debug-file '$CONFIG_DIR/logs/$name.log'"
+  if window_exists "$name"; then
+    tm respawn-window -k -t "$TMUX_SESSION:$name" -c "$dir" "$rc_cmd"; echo "${C_GREEN}再起動:${C_RESET} $name"
+  else
+    tm new-window -t "$TMUX_SESSION" -n "$name" -c "$dir" "$rc_cmd"; echo "${C_GREEN}起動:${C_RESET}   $name"
+  fi
+  if window_exists "__base__" && [ "$(tm list-windows -t "$TMUX_SESSION" | wc -l)" -gt 1 ]; then
+    tm kill-window -t "$TMUX_SESSION:__base__" 2>/dev/null || true
+  fi
+}
+
+# rc-on <フォルダパス> : そのフォルダの remote-control を起動（トグルON）
+cmd_rcon() {
+  need_tmux
+  [ -n "${1:-}" ] || die "使い方: $(basename "$0") rc-on <フォルダパス>"
+  local dir; dir="$(cd "$1" 2>/dev/null && pwd)" || die "フォルダが見つかりません: $1"
+  _rc_start_dir "$dir"
+}
+
+# rc-off <フォルダパス|表示名> : その remote-control 窓を停止（トグルOFF）
+#   ※ 停止するのは tmux の窓のみ。スマホからの現接続は tmux 窓ではないので影響しない。
+cmd_rcoff() {
+  need_tmux
+  [ -n "${1:-}" ] || die "使い方: $(basename "$0") rc-off <フォルダパス|表示名>"
+  tm has-session -t "$TMUX_SESSION" 2>/dev/null || { echo "起動中のセッションはありません。"; return 0; }
+  local name
+  if [ -d "$1" ]; then name="$(project_name "$(cd "$1" && pwd)")"; else name="$1"; fi
+  if window_exists "$name"; then
+    tm kill-window -t "$TMUX_SESSION:$name"; echo "${C_YELLOW}停止:${C_RESET} $name"
+  else
+    echo "起動していません: $name"
+  fi
+}
+
+# rc-on-recent [N] : 直近N件のうち未起動のものを一括で起動（一気にON）
+cmd_rcon_recent() {
+  need_tmux
+  local n="${1:-10}" cwd name run started=0
+  while IFS=$'\t' read -r cwd name run; do
+    [ -n "$cwd" ] || continue
+    if [ "$run" != "1" ]; then _rc_start_dir "$cwd" >/dev/null 2>&1 && started=$((started + 1)); fi
+  done < <(cmd_recent "$n" --porcelain)
+  echo "直近${n}件のうち ${started} 件を起動しました。"
+}
+
+# ---- セッション単位（PCで作った既存の会話を resume して remote-control）----
+# セッション用の tmux 窓名（session_id 先頭8文字で一意化）
+_sess_win() { printf 'sess-%s' "$(printf '%s' "$1" | cut -c1-8)"; }
+
+# sessions [N] [--porcelain] : 直近使用したセッション（会話）を新しい順に列挙
+#   porcelain TSV: <session_id>\t<cwd>\t<稼働0/1>\t<要約>
+cmd_sessions() {
+  need_tmux
+  local n=10 porcelain=0 a
+  for a in "$@"; do
+    case "$a" in
+      --porcelain) porcelain=1 ;;
+      *[!0-9]*|'') : ;;
+      *) n="$a" ;;
+    esac
+  done
+  local projdir="$HOME/.claude/projects"
+  [ -d "$projdir" ] || { [ "$porcelain" = 1 ] || echo "(履歴なし)"; return 0; }
+  local has_sess=0; tm has-session -t "$TMUX_SESSION" 2>/dev/null && has_sess=1
+  local now count=0 f sid cwd summ win running mt
+  now="$(date +%s)"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    # 直近90秒に書き込まれた＝現在アクティブな会話（今の接続含む）は除外。
+    # 目的は「PCで作って off になった会話」を出すこと。
+    mt="$(stat -f %m "$f" 2>/dev/null || echo 0)"
+    [ $((now - mt)) -lt 90 ] && continue
+    sid="$(basename "$f" .jsonl)"
+    cwd="$(grep -m1 -o '"cwd":"[^"]*"' "$f" 2>/dev/null | head -1 | sed 's/.*"cwd":"//; s/"$//')"
+    [ -n "$cwd" ] && [ -d "$cwd" ] || continue
+    # 要約：最初のユーザ文からコマンドタグ等を除き、UTF-8安全に約30字（末尾の欠けバイトは iconv -c で除去）
+    summ="$(grep -m1 '"role":"user"' "$f" 2>/dev/null | grep -o '"content":"[^"]*"' | head -1 | sed 's/"content":"//; s/"$//')"
+    [ -n "$summ" ] || summ="$(grep -m1 '"type":"user"' "$f" 2>/dev/null | grep -o '"content":"[^"]*"' | head -1 | sed 's/"content":"//; s/"$//')"
+    summ="$(printf '%s' "$summ" | sed 's/<[^>]*>//g; s/\\[a-z]//g' | cut -c1-40 | iconv -f UTF-8 -t UTF-8 -c 2>/dev/null)"
+    [ -n "$summ" ] || summ="(無題)"
+    win="$(_sess_win "$sid")"
+    running=0
+    if [ "$has_sess" = 1 ] && window_exists "$win" && pane_alive "$win"; then running=1; fi
+    if [ "$porcelain" = 1 ]; then
+      printf '%s\t%s\t%s\t%s\n' "$sid" "$cwd" "$running" "$summ"
+    else
+      if [ "$running" = 1 ]; then printf "  ${C_GREEN}●${C_RESET} %-16s %s\n" "$(basename "$cwd")" "$summ"
+      else printf "  ${C_DIM}○${C_RESET} %-16s %s\n" "$(basename "$cwd")" "$summ"; fi
+    fi
+    count=$((count + 1)); [ "$count" -ge "$n" ] && break
+  done < <(ls -t "$projdir"/*/*.jsonl 2>/dev/null)
+}
+
+# session-on <session_id> <cwd> : 既存会話を resume して remote-control 起動（GUIトグルON）
+#   コスト確認プロンプトが出たら RC_RESUME_MODE（1=要約[既定] / 2=全体）で自動選択
+cmd_session_on() {
+  need_tmux
+  local sid="${1:-}" dir="${2:-}"
+  [ -n "$sid" ] && [ -n "$dir" ] || die "使い方: $(basename "$0") session-on <session_id> <cwd>"
+  dir="$(cd "$dir" 2>/dev/null && pwd)" || die "フォルダが見つかりません: $2"
+  local CLAUDE_BIN; CLAUDE_BIN="$(command -v claude || true)"
+  [ -n "$CLAUDE_BIN" ] || die "claude が見つかりません。"
+  ensure_session
+  local win; win="$(_sess_win "$sid")"
+  if window_exists "$win" && pane_alive "$win"; then echo "${C_DIM}既に稼働中:${C_RESET} $win"; return 0; fi
+  local label mode rc_cmd
+  label="$(project_name "$dir")·$(printf '%s' "$sid" | cut -c1-6)"
+  mode="${RC_RESUME_MODE:-1}"
+  rc_cmd="'$CLAUDE_BIN' --resume '$sid' --remote-control --name '$label'"
+  [ -n "${RC_PERMISSION_MODE:-}" ] && rc_cmd="$rc_cmd --permission-mode '$RC_PERMISSION_MODE'"
+  if window_exists "$win"; then tm respawn-window -k -t "$TMUX_SESSION:$win" -c "$dir" "$rc_cmd"
+  else tm new-window -t "$TMUX_SESSION" -n "$win" -c "$dir" "$rc_cmd"; fi
+  # resume のコスト確認プロンプトが出たら自動選択。無ければ何もしない（誤入力防止に検出ベース）。
+  local i pane
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    pane="$(tm capture-pane -p -J -t "$TMUX_SESSION:$win" 2>/dev/null || true)"
+    case "$pane" in
+      *"Resume from summary"*|*"Resume full session"*)
+        tm send-keys -t "$TMUX_SESSION:$win" "$mode" Enter 2>/dev/null || true; break ;;
+      *"remote-control is active"*) break ;;
+    esac
+  done
+  if window_exists "__base__" && [ "$(tm list-windows -t "$TMUX_SESSION" | wc -l)" -gt 1 ]; then
+    tm kill-window -t "$TMUX_SESSION:__base__" 2>/dev/null || true
+  fi
+  echo "${C_GREEN}resume+RC 起動:${C_RESET} $label"
+}
+
+# session-off <session_id> : そのセッションの RC 窓を停止（GUIトグルOFF）
+cmd_session_off() {
+  need_tmux
+  local sid="${1:-}"; [ -n "$sid" ] || die "使い方: $(basename "$0") session-off <session_id>"
+  tm has-session -t "$TMUX_SESSION" 2>/dev/null || { echo "起動中のセッションはありません。"; return 0; }
+  local win; win="$(_sess_win "$sid")"
+  if window_exists "$win"; then tm kill-window -t "$TMUX_SESSION:$win"; echo "${C_YELLOW}停止:${C_RESET} $win"
+  else echo "起動していません: $win"; fi
+}
+
+# ---- ダッシュボード（GUI）用：登録済み一覧 / 未登録Gitフォルダ / 登録解除 ----
+
+# registered [--porcelain] : ACTIVE_DIRS を状態つきで列挙
+#   porcelain TSV: <path>\t<name>\t<稼働0/1>\t<フォルダ存在0/1>
+cmd_registered() {
+  load_config
+  need_tmux
+  local porcelain=0; [ "${1:-}" = "--porcelain" ] && porcelain=1
+  local has=0; tm has-session -t "$TMUX_SESSION" 2>/dev/null && has=1
+  local d name run ex
+  for d in "${ACTIVE_DIRS[@]}"; do
+    [ -n "$d" ] || continue; d="${d%/}"
+    name="$(project_name "$d")"
+    ex=0; [ -d "$d" ] && ex=1
+    run=0; if [ "$has" = 1 ] && window_exists "$name" && pane_alive "$name"; then run=1; fi
+    if [ "$porcelain" = 1 ]; then printf '%s\t%s\t%s\t%s\n' "$d" "$name" "$run" "$ex"
+    else
+      if [ "$run" = 1 ]; then printf "  ${C_GREEN}●${C_RESET} %-20s %s\n" "$name" "$d"
+      elif [ "$ex" = 0 ]; then printf "  ${C_YELLOW}⚠${C_RESET} %-20s %s (フォルダ無し)\n" "$name" "$d"
+      else printf "  ${C_DIM}○${C_RESET} %-20s %s\n" "$name" "$d"; fi
+    fi
+  done
+}
+
+# git-folders [--porcelain] : SCAN_DIRS 直下の Git リポで未登録のものを列挙
+#   porcelain TSV: <path>\t<name>
+cmd_git_folders() {
+  load_config
+  local porcelain=0; [ "${1:-}" = "--porcelain" ] && porcelain=1
+  local act=" " d low root
+  for d in "${ACTIVE_DIRS[@]}"; do [ -n "$d" ] && act="$act$(_lc "${d%/}") "; done
+  for root in "${SCAN_DIRS[@]}"; do
+    [ -d "$root" ] || continue
+    for d in "$root"/*/; do
+      d="${d%/}"
+      [ -e "$d/.git" ] || continue
+      low="$(_lc "$d")"
+      case "$act" in *" $low "*) continue ;; esac
+      if [ "$porcelain" = 1 ]; then printf '%s\t%s\n' "$d" "$(project_name "$d")"
+      else printf "  %s\n" "$d"; fi
+    done
+  done
+}
+
+# unregister <path> : ACTIVE_DIRS から削除（＝GUIのゴミ箱）。稼働窓も停止。
+#   config.sh は該当エントリ行をコメントアウト（可逆・他の設定/コメントは保持）。
+cmd_unregister() {
+  load_config
+  need_tmux
+  [ -n "${1:-}" ] || die "使い方: $(basename "$0") unregister <パス>"
+  local target; target="$(cd "$1" 2>/dev/null && pwd || printf '%s' "${1%/}")"
+  target="${target%/}"
+  local tl; tl="$(_lc "$target")"
+  local name; name="$(project_name "$target")"
+  # 稼働窓を停止（あれば）
+  if tm has-session -t "$TMUX_SESSION" 2>/dev/null && window_exists "$name"; then
+    tm kill-window -t "$TMUX_SESSION:$name" 2>/dev/null || true
+  fi
+  # config.sh を走査：ACTIVE_DIRS 配列ブロック内 or += 行で、対象パスに一致する要素行をコメント化
+  local tmp="$CONFIG_FILE.tmp.$$" in_arr=0 hit=0 line q expanded ql is_entry
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in *"ACTIVE_DIRS=("*) in_arr=1 ;; esac
+    is_entry=0
+    if printf '%s' "$line" | grep -q 'ACTIVE_DIRS+=('; then is_entry=1; fi
+    if [ "$in_arr" = 1 ] && printf '%s' "$line" | grep -qE '^[[:space:]]*"'; then is_entry=1; fi
+    if [ "$is_entry" = 1 ]; then
+      q="$(printf '%s' "$line" | sed -n 's/.*"\([^"]*\)".*/\1/p')"
+      if [ -n "$q" ]; then
+        expanded="$q"
+        expanded="${expanded/\$HOME/$HOME}"
+        expanded="${expanded/#\~/$HOME}"
+        expanded="${expanded%/}"
+        ql="$(_lc "$expanded")"
+        if [ "$ql" = "$tl" ]; then
+          printf '# [unregistered by claude-rc] %s\n' "$line" >> "$tmp"
+          hit=1
+          case "$line" in *")"*) if [ "$in_arr" = 1 ]; then in_arr=0; fi ;; esac
+          continue
+        fi
+      fi
+    fi
+    case "$line" in *")"*) if [ "$in_arr" = 1 ]; then in_arr=0; fi ;; esac
+    printf '%s\n' "$line" >> "$tmp"
+  done < "$CONFIG_FILE"
+  mv "$tmp" "$CONFIG_FILE"
+  if [ "$hit" = 1 ]; then echo "${C_YELLOW}登録解除:${C_RESET} $name  ($target)"
+  else echo "${C_DIM}config に該当エントリが見つかりませんでした:${C_RESET} $target"; fi
+}
+
+# getcfg <KEY> : config.sh の変数値を出力（GUI設定の読み出し）
+cmd_getcfg() {
+  load_config
+  [ -n "${1:-}" ] || return 0
+  printf '%s' "${!1:-}"
+}
+
+# setcfg <KEY> <VALUE> : config.sh の KEY="VALUE" を置換 or 追記（GUI設定の保存）
+cmd_setcfg() {
+  [ -n "${1:-}" ] || die "使い方: $(basename "$0") setcfg <KEY> <VALUE>"
+  local key="$1" val="${2:-}" tmp="$CONFIG_FILE.tmp.$$" found=0 line
+  ensure_config
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key="*) printf '%s="%s"\n' "$key" "$val" >> "$tmp"; found=1 ;;
+      *)        printf '%s\n' "$line" >> "$tmp" ;;
+    esac
+  done < "$CONFIG_FILE"
+  [ "$found" = 0 ] && printf '%s="%s"\n' "$key" "$val" >> "$tmp"
+  mv "$tmp" "$CONFIG_FILE"
+  echo "設定を保存: $key=$val"
+}
+
+# dashboard : ローカルWebサーバーを起動し、管理画面をアプリ風ウィンドウで開く
+cmd_dashboard() {
+  local port="${RC_DASH_PORT:-8787}"
+  local dir="$CONFIG_DIR/dashboard"
+  [ -f "$dir/server.py" ] || die "$dir/server.py がありません。"
+  local py; py="$(command -v python3 || true)"
+  [ -n "$py" ] || die "python3 が必要です。"
+  mkdir -p "$CONFIG_DIR/logs"
+  local rc_bin; rc_bin="$(command -v claude-rc || echo "$HOME/bin/claude-rc")"
+  if ! curl -s "http://127.0.0.1:$port/api/ping" >/dev/null 2>&1; then
+    RC_DASH_PORT="$port" CLAUDE_RC_BIN="$rc_bin" nohup "$py" "$dir/server.py" \
+      >>"$CONFIG_DIR/logs/dashboard.log" 2>&1 &
+    sleep 1
+  fi
+  local url="http://127.0.0.1:$port/"
+  # Chrome の --app 窓で開く。`open -na --args` は Chrome 起動中だと --app が無視される
+  # macOS の癖があるため、バイナリを直接叩く（起動中でも新規アプリ窓が開く）。
+  local chrome="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+  if [ -x "$chrome" ]; then
+    "$chrome" --app="$url" >/dev/null 2>&1 &
+  else
+    open "$url" >/dev/null 2>&1 || true
+  fi
+  echo "ダッシュボード: $url"
+}
+
+cmd_attach() {
+  need_tmux
+  tm has-session -t "$TMUX_SESSION" 2>/dev/null \
+    || die "セッションがありません。先に '$(basename "$0") start' してください。"
+  echo "${C_DIM}ヒント: 窓の切替は Ctrl-b → n/p、デタッチは Ctrl-b → d${C_RESET}"
+  tm attach -t "$TMUX_SESSION"
+}
+
+cmd_help() {
+  local me; me="$(basename "$0")"
+  cat <<EOF
+${C_BOLD}claude-rc${C_RESET} — Claude Code Remote Control をフォルダ単位で管理
+
+使い方:
+  ${C_BOLD}$me list${C_RESET}               SCAN_DIRS を走査し Git/CLAUDE.md を一覧化（inventory.md も出力）
+  ${C_BOLD}$me start [名前]${C_RESET}        ACTIVE_DIRS を一括起動（名前を付けるとその1つだけ）
+  ${C_BOLD}$me stop [名前]${C_RESET}         全停止（名前を付けるとその1つだけ停止）
+  ${C_BOLD}$me restart <名前>${C_RESET}      指定プロジェクトを再起動
+  ${C_BOLD}$me add [--no-repo] <フォルダ>${C_RESET}  新フォルダを常駐追加＋起動（既定は private GitHubリポも作成。--no-repo でリポ無し）
+  ${C_BOLD}$me dashboard${C_RESET}          管理パネル(ローカルWeb)を起動しアプリ風ウィンドウで開く
+  ${C_BOLD}$me status${C_RESET}             各サーバーの稼働状況と接続URLを表示
+  ${C_BOLD}$me watch [間隔]${C_RESET}       status を定期更新表示（既定 3 秒・例: 1s 30s 5m 1h / 数字のみ=秒）
+  ${C_BOLD}$me pause${C_RESET}              自己修復(launchd)を一時停止 → stop が復活せず効く
+  ${C_BOLD}$me resume${C_RESET}             自己修復を再開
+  ${C_BOLD}$me attach${C_RESET}             専用 tmux セッションにアタッチして画面を覗く
+  ${C_BOLD}$me recent [N]${C_RESET}         直近使用したフォルダを新しい順に表示（既定10・--porcelain でTSV）
+  ${C_BOLD}$me rc-on <パス>${C_RESET}       そのフォルダの remote-control を起動（GUIトグルON）
+  ${C_BOLD}$me rc-off <パス|名前>${C_RESET} その remote-control 窓を停止（GUIトグルOFF）
+  ${C_BOLD}$me rc-on-recent [N]${C_RESET}   直近N件の未起動をまとめて起動（一気にON）
+  ${C_BOLD}$me sessions [N]${C_RESET}       直近使用した「会話（セッション）」を新しい順に表示（既定10）
+  ${C_BOLD}$me session-on <id> <cwd>${C_RESET}  既存の会話を resume して remote-control（PCの会話をスマホで再開）
+  ${C_BOLD}$me session-off <id>${C_RESET}   その会話の remote-control を停止
+  ${C_BOLD}$me json${C_RESET}              GUI用の機械可読状態（TSV: 名前 / 状態 / URL）
+
+設定ファイル ($CONFIG_FILE):
+  SCAN_DIRS            list でスキャンする親ディレクトリ
+  ACTIVE_DIRS          start で常駐させるプロジェクト（フルパス）
+  START_STAGGER_SECS   起動の時差（既定 2 秒・429 対策）
+  RC_PERMISSION_MODE   権限モード（acceptEdits / bypassPermissions 等・既定は毎回承認）
+  RC_DEBUG_LOG         1 で詳細 debug ログを各台に残す（既定 0）
+  RC_AUTO_REPO         1でstart時にも private GitHubリポを自動作成（既定 0＝自動pushしない・安全。add は既定で作成）
+
+備考:
+  ・名前は status の表示名（例 Vloger / Physical_AI）を使う。
+  ・各プロジェクトは初回に一度 'claude' を起動して workspace trust を承認しておくこと。
+  ・常時稼働させるなら Mac のスリープを無効化（または caffeinate）すること。
+EOF
+}
+
+main() {
+  local sub="${1:-help}"
+  shift 2>/dev/null || true
+  case "$sub" in
+    list|ls|discover) cmd_list "$@" ;;
+    start|up)         cmd_start "$@" ;;
+    add)              cmd_add "$@" ;;
+    status|st)        cmd_status "$@" ;;
+    watch)            cmd_watch "$@" ;;
+    restart|rs)       cmd_restart "$@" ;;
+    stop|down)        cmd_stop "$@" ;;
+    pause)            cmd_pause "$@" ;;
+    resume)           cmd_resume "$@" ;;
+    attach)           cmd_attach "$@" ;;
+    recent)           cmd_recent "$@" ;;
+    json)             cmd_json "$@" ;;
+    rc-on)            cmd_rcon "$@" ;;
+    rc-off)           cmd_rcoff "$@" ;;
+    rc-on-recent)     cmd_rcon_recent "$@" ;;
+    sessions)         cmd_sessions "$@" ;;
+    session-on)       cmd_session_on "$@" ;;
+    session-off)      cmd_session_off "$@" ;;
+    registered)       cmd_registered "$@" ;;
+    git-folders)      cmd_git_folders "$@" ;;
+    unregister)       cmd_unregister "$@" ;;
+    getcfg)           cmd_getcfg "$@" ;;
+    setcfg)           cmd_setcfg "$@" ;;
+    dashboard|gui)    cmd_dashboard "$@" ;;
+    help|-h|--help)   cmd_help ;;
+    *) die "不明なコマンド: $sub  （'$(basename "$0") help' を参照）" ;;
+  esac
+}
+
+main "$@"

@@ -1,0 +1,13 @@
+# user config (contains folder paths and access token)
+config.sh
+
+# runtime artifacts
+logs/
+*.log
+*.sock
+*.crash.log
+
+# os / editor
+.DS_Store
+.idea/
+.vscode/

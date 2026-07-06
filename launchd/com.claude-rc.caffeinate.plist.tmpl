@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- claude-rc caffeinate agent: 常駐サーバーがスリープで落ちないよう
+     システムスリープを抑止する。ラップトップは蓋を閉じると効かない場合が
+     ある（電源接続＋外部ディスプレイならクラムシェルでも可）。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.claude-rc.caffeinate</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.config/claude-rc/logs/caffeinate.err.log</string>
+</dict>
+</plist>

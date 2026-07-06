@@ -1,0 +1,15 @@
+{
+  "name": "claude-rc コントロールパネル",
+  "short_name": "claude-rc",
+  "description": "Claude Code の remote-control をフォルダ/セッション単位で管理",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0d0f12",
+  "theme_color": "#0d0f12",
+  "icons": [
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" },
+    { "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "maskable" }
+  ]
+}

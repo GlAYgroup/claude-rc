@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- claude-rc self-heal agent: 起動時＋5分ごとに `claude-rc start` を実行し、
+     落ちた常駐だけを復活させる。__HOME__ は install.sh が実パスに置換する。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.claude-rc.start</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/bin/claude-rc</string>
+    <string>start</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/bin:__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>WorkingDirectory</key>
+  <string>__HOME__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>300</integer>
+  <key>StandardOutPath</key>
+  <string>/dev/null</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.config/claude-rc/logs/launchd.start.err.log</string>
+</dict>
+</plist>
