@@ -381,15 +381,21 @@ document.querySelectorAll('.tabs button').forEach(b=>b.addEventListener('click',
   for(const k in panels) panels[k].classList.toggle('panel-hidden',k!==b.dataset.tab);
 }));
 // masters
-$('#regMaster').addEventListener('change',e=>act('/api/bulk',{scope:'registered',on:e.target.checked},'常駐を一括操作'));
+$('#regMaster').addEventListener('change',async e=>{
+  const on=e.target.checked;
+  if(!on && !(await askConfirm('稼働中の常駐をすべて停止します。よろしいですか？','一括OFF'))){e.target.checked=true;return;}
+  act('/api/bulk',{scope:'registered',on},'常駐を一括操作');
+});
 $('#sesMaster').addEventListener('change',async e=>{
   const on=e.target.checked;
   if(on && !(await askConfirm('直近の会話を一括で再開します。トークンを消費します。よろしいですか？','一括ON',true))){e.target.checked=false;return;}
+  if(!on && !(await askConfirm('再開中の会話をすべて停止します。よろしいですか？','一括OFF'))){e.target.checked=true;return;}
   act('/api/bulk',{scope:'sessions',on},'セッションを一括操作');
 });
 $('#masterAll').addEventListener('change',async e=>{
   const on=e.target.checked;
   if(on && !(await askConfirm('フォルダとセッションを全部オンにします。よろしいですか？','一括ON',true))){e.target.checked=false;return;}
+  if(!on && !(await askConfirm('フォルダとセッションをすべて停止します。よろしいですか？','一括OFF'))){e.target.checked=true;return;}
   act('/api/bulk',{scope:'all',on},'すべて一括操作');
 });
 $('#addBtn').addEventListener('click',async()=>{
