@@ -13,27 +13,29 @@
 <title>claude-rc</title>
 <style>
   :root{
-    --ink:#eef2f7; --ink-dim:#b0bcc8; --ink-faint:#828f9c;
-    --accent:#4aa3ff; --on:#40d069; --off:#6a7580; --warn:#ecb22e; --bad:#ff6a52;
-    /* glass surfaces（半透明＋ぼかしで背景が透ける） */
-    --glass:   rgba(24,30,38,0.50);
-    --glass-2: rgba(36,44,54,0.58);
-    --glass-3: rgba(255,255,255,0.055);
-    --hi: rgba(255,255,255,0.11);
-    --line: rgba(255,255,255,0.10);
-    --line-soft: rgba(255,255,255,0.06);
-    --r:16px;
-    --blur: saturate(1.7) blur(26px);
-    --blur-sm: saturate(1.5) blur(14px);
+    --ink:#eef1f5; --ink-dim:#a8b1bb; --ink-faint:#79838d;
+    --accent:#3b82f6; --on:#34c759; --off:#6a7580; --warn:#ecb22e; --bad:#ff6a52;
+    /* 半透明ガラス（黒基調・ニュートラル。背景の淡い光が透ける） */
+    --glass:   rgba(255,255,255,0.055);
+    --glass-2: rgba(255,255,255,0.085);
+    --glass-3: rgba(255,255,255,0.05);
+    --hi: rgba(255,255,255,0.075);
+    --line: rgba(255,255,255,0.075);
+    --line-soft: rgba(255,255,255,0.05);
+    --r:17px;
+    --blur: saturate(1.25) blur(30px);
+    --blur-sm: saturate(1.15) blur(16px);
   }
   *{box-sizing:border-box}
   html,body{margin:0}
   body{
+    /* ほぼ黒＋淡い光のぼかし（macOS vibrancy 風・モノクロで静か） */
     background:
-      radial-gradient(1100px 520px at 10% -12%, rgba(74,128,196,0.34), transparent 56%),
-      radial-gradient(900px 560px at 104% 6%, rgba(64,208,138,0.18), transparent 55%),
-      radial-gradient(1000px 720px at 50% 122%, rgba(126,96,208,0.20), transparent 55%),
-      #090c10;
+      radial-gradient(520px 400px at 16% 20%, rgba(255,255,255,0.05), transparent 62%),
+      radial-gradient(480px 440px at 84% 9%, rgba(255,255,255,0.038), transparent 62%),
+      radial-gradient(560px 520px at 74% 84%, rgba(255,255,255,0.033), transparent 62%),
+      radial-gradient(440px 380px at 22% 96%, rgba(255,255,255,0.03), transparent 62%),
+      #0a0b0d;
     background-attachment:fixed;
     color:var(--ink);
     font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Hiragino Kaku Gothic ProN","Yu Gothic",system-ui,sans-serif;
@@ -109,12 +111,12 @@
     border:1px solid var(--line);transition:.18s;box-shadow:inset 0 1px 2px rgba(0,0,0,.25)}
   .sw .kb{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:50%;background:#eef2f7;transition:.18s;
     box-shadow:0 1px 3px rgba(0,0,0,.5)}
-  .sw input:checked + .tk{background:var(--accent);border-color:transparent;box-shadow:0 0 14px rgba(74,163,255,.45)}
+  .sw input:checked + .tk{background:var(--accent);border-color:transparent}
   .sw input:checked + .tk + .kb{left:21px;background:#fff}
   .sw input:focus-visible + .tk{outline:2px solid var(--accent);outline-offset:2px}
   .sw.sw-lg{width:54px;height:30px}.sw.sw-lg .kb{width:24px;height:24px}
   .sw.sw-lg input:checked + .tk + .kb{left:27px}
-  .sw.grn input:checked + .tk{background:var(--on);box-shadow:0 0 14px rgba(64,208,105,.5)}
+  .sw.grn input:checked + .tk{background:var(--on)}
   .sw input:disabled{cursor:default}.sw input:disabled + .tk{opacity:.45}
 
   .addbtn{width:100%;display:flex;align-items:center;justify-content:center;gap:8px;background:rgba(255,255,255,0.04);
