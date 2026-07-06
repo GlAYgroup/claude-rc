@@ -11,6 +11,14 @@
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/icon-180.png">
 <title>claude-rc</title>
+<script>
+  // ネイティブの vibrancy パネル（?native=1）から読み込まれたときは、疑似ぼかし背景を消して
+  // 本物のデスクトップ透過（NSVisualEffectView）をそのまま見せる。
+  // <body> が無い head 解析時点でも触れる <html> にクラスを同期で足す（描画のチラつき防止）。
+  if (new URLSearchParams(location.search).get('native') === '1') {
+    document.documentElement.classList.add('native');
+  }
+</script>
 <style>
   :root{
     --ink:#eef1f5; --ink-dim:#a8b1bb; --ink-faint:#79838d;
@@ -42,6 +50,9 @@
     -webkit-font-smoothing:antialiased; line-height:1.45; padding:22px 14px calc(60px + env(safe-area-inset-bottom));
     display:flex; justify-content:center;
   }
+  /* ネイティブの本物vibrancy(NSVisualEffectView)から読み込まれた時は、疑似ぼかしを消して
+     デスクトップの本物の透過をそのまま透かす。ガラスパネル自体はそのまま(その上に乗る)。 */
+  html.native body{ background:transparent; }
   .app{width:100%; max-width:520px}
   .head{display:flex; align-items:center; gap:12px; padding:2px 4px 16px}
   .mark{width:38px;height:38px;border-radius:11px;flex:none;background:var(--glass-2);
