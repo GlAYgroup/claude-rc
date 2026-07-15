@@ -11,3 +11,6 @@ logs/
 .DS_Store
 .idea/
 .vscode/
+
+# native app build output (rebuild via native/build.sh)
+native/build/
