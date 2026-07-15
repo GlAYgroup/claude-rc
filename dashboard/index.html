@@ -23,13 +23,14 @@
   :root{
     --ink:#eef1f5; --ink-dim:#a8b1bb; --ink-faint:#79838d;
     --accent:#3b82f6; --on:#34c759; --off:#6a7580; --warn:#ecb22e; --bad:#ff6a52;
-    /* 半透明ガラス（黒基調・ニュートラル。背景の淡い光が透ける） */
-    --glass:   rgba(255,255,255,0.055);
-    --glass-2: rgba(255,255,255,0.085);
-    --glass-3: rgba(255,255,255,0.05);
-    --hi: rgba(255,255,255,0.075);
-    --line: rgba(255,255,255,0.075);
-    --line-soft: rgba(255,255,255,0.05);
+    /* 半透明ガラス（黒基調・ニュートラル。背景の淡い光が透ける）
+       ※ どんな背景でも読めるよう、面と輪郭はやや強め（html.native のスクリムとセット） */
+    --glass:   rgba(255,255,255,0.07);
+    --glass-2: rgba(255,255,255,0.10);
+    --glass-3: rgba(255,255,255,0.06);
+    --hi: rgba(255,255,255,0.09);
+    --line: rgba(255,255,255,0.10);
+    --line-soft: rgba(255,255,255,0.06);
     --r:17px;
     --blur: saturate(1.25) blur(30px);
     --blur-sm: saturate(1.15) blur(16px);
@@ -50,9 +51,10 @@
     -webkit-font-smoothing:antialiased; line-height:1.45; padding:22px 14px calc(60px + env(safe-area-inset-bottom));
     display:flex; justify-content:center;
   }
-  /* ネイティブの本物vibrancy(NSVisualEffectView)から読み込まれた時は、疑似ぼかしを消して
-     デスクトップの本物の透過をそのまま透かす。ガラスパネル自体はそのまま(その上に乗る)。 */
-  html.native body{ background:transparent; }
+  /* ネイティブの本物vibrancy(NSVisualEffectView)から読み込まれた時は、疑似ぼかしの模様を消し、
+     代わりに暗色スクリムを1枚敷く。Control Center と同じ考え方: 背後のデスクトップは
+     本物のブラーで透けるが、どんなに明るい/騒がしい背景でも文字のコントラストは保証される。 */
+  html.native body{ background: rgba(10,11,15,0.55); }
   .app{width:100%; max-width:520px}
   .head{display:flex; align-items:center; gap:12px; padding:2px 4px 16px}
   .mark{width:38px;height:38px;border-radius:11px;flex:none;background:var(--glass-2);
@@ -177,6 +179,22 @@
   .modal button:hover{color:var(--ink);border-color:rgba(255,255,255,0.22)}
   .modal button.ok{background:var(--bad);border-color:transparent;color:#fff}
   .modal button.ok.blue{background:var(--accent);border-color:transparent;color:#05121f}
+  /* 行ドラッグで常駐から外す */
+  #regRows .row .info{cursor:grab;-webkit-user-select:none;user-select:none}
+  #regRows .row .info:active{cursor:grabbing}
+  .row.dragsrc{opacity:.35}
+  .row.ghost{position:fixed;z-index:40;pointer-events:none;transform:translate(-50%,-50%);
+    background:rgba(28,32,40,0.92);border:1px solid var(--line);border-radius:12px;
+    -webkit-backdrop-filter:var(--blur-sm);backdrop-filter:var(--blur-sm);
+    box-shadow:0 14px 44px rgba(0,0,0,.55)}
+  #dropzone{position:fixed;left:12px;right:12px;bottom:12px;z-index:35;
+    border:1.5px dashed var(--bad);border-radius:14px;color:#ffb4a4;background:rgba(255,106,82,.13);
+    -webkit-backdrop-filter:blur(14px);backdrop-filter:blur(14px);
+    text-align:center;padding:17px 12px;font-size:13px;font-weight:640;
+    opacity:0;transform:translateY(8px);transition:.18s}
+  #dropzone.show{opacity:1;transform:none}
+  #dropzone.hot{background:rgba(255,106,82,.30);color:#fff;border-style:solid}
+
   @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -349,10 +367,59 @@ function swRow(checked,disabled){
   return `<label class="sw"><input type="checkbox" ${checked?'checked':''} ${disabled?'disabled':''}><span class="tk"></span><span class="kb"></span></label>`;
 }
 
+// 常駐行を掴んで下のゾーンへドロップ → 登録解除（ゴミ箱ボタンと同じ操作の別ルート）。
+// トグルやゴミ箱のクリックを奪わないよう、.info 部分からのドラッグのみ・14px動いてから発動。
+let dragging=false;
+function enableDragRemove(row,x){
+  const info=row.querySelector('.info');
+  info.style.touchAction='none';
+  info.addEventListener('pointerdown',ev=>{
+    if(ev.button!==0) return;
+    const sx=ev.clientX, sy=ev.clientY;
+    let started=false, ghost=null, zone=null;
+    const cleanup=()=>{
+      window.removeEventListener('pointermove',move);
+      window.removeEventListener('pointerup',up);
+      window.removeEventListener('pointercancel',cancel);
+      if(ghost)ghost.remove(); if(zone)zone.remove();
+      row.classList.remove('dragsrc'); dragging=false;
+    };
+    const move=e=>{
+      if(!started){
+        if(Math.hypot(e.clientX-sx,e.clientY-sy)<14) return;
+        started=true; dragging=true;
+        ghost=row.cloneNode(true); ghost.classList.add('ghost');
+        ghost.style.width=row.offsetWidth+'px';
+        document.body.appendChild(ghost);
+        zone=document.createElement('div'); zone.id='dropzone';
+        zone.textContent='🗑 ここにドロップで常駐から外す';
+        document.body.appendChild(zone);
+        row.classList.add('dragsrc');
+        requestAnimationFrame(()=>zone.classList.add('show'));
+      }
+      ghost.style.left=e.clientX+'px'; ghost.style.top=e.clientY+'px';
+      zone.classList.toggle('hot', e.clientY>=zone.getBoundingClientRect().top-8);
+    };
+    const up=async e=>{
+      const hit = started && e.clientY>=zone.getBoundingClientRect().top-8;
+      const wasStarted=started;
+      cleanup();
+      if(!wasStarted) return;
+      if(hit && await askConfirm(`「${x.name}」を常駐リストから外しますか？（フォルダ自体は消えません）`,'外す'))
+        act('/api/folder-remove',{path:x.path},`${x.name} を登録解除`);
+    };
+    const cancel=()=>cleanup();
+    window.addEventListener('pointermove',move);
+    window.addEventListener('pointerup',up);
+    window.addEventListener('pointercancel',cancel);
+  });
+}
+
 function render(st){
   $('#runN').textContent=st.running;
   // registered
-  const rg=$('#regRows'); $('#regCount').textContent=st.registered.length;
+  const rg=$('#regRows');
+  $('#regCount').textContent=`${st.registered.filter(x=>x.run).length}/${st.registered.length} 稼働`;
   rg.innerHTML = st.registered.length ? st.registered.map((x,i)=>`
     <div class="row" data-i="${i}">
       <span class="st ${x.run?'on':(x.exists?'':'warn')}"></span>
@@ -370,6 +437,7 @@ function render(st){
       if(await askConfirm(`「${x.name}」を常駐リストから削除しますか？（フォルダ自体は消えません）`,'削除'))
         act('/api/folder-remove',{path:x.path},`${x.name} を登録解除`);
     });
+    enableDragRemove(row,x);
   });
   // git unregistered
   const gt=$('#gitRows'); $('#gitCount').textContent=st.git.length;
@@ -383,7 +451,8 @@ function render(st){
     row.querySelector('.sw input').addEventListener('change',()=>act('/api/folder-add',{path:x.path},`${x.name} を常駐に追加`));
   });
   // sessions
-  const ss=$('#sesRows'); $('#sesCount').textContent=st.sessions.length;
+  const ss=$('#sesRows');
+  $('#sesCount').textContent=`${st.sessions.filter(x=>x.run).length}/${st.sessions.length} 稼働`;
   ss.innerHTML = st.sessions.length ? st.sessions.map((x,i)=>`
     <div class="row" data-i="${i}"><span class="st ${x.run?'on':''}"></span>
       <div class="info"><div class="nm">${esc(x.summary||x.id.slice(0,8))}</div>
@@ -420,7 +489,10 @@ function render(st){
     b.addEventListener('click',()=>copyText(b.dataset.url)));
 }
 
-async function load(){ try{ render(await api.state()); }catch(e){ toast('サーバーに接続できません',true);} }
+async function load(){
+  if(dragging) return;  // ドラッグ中の再描画は行を消してしまうので保留
+  try{ render(await api.state()); }catch(e){ toast('サーバーに接続できません',true);}
+}
 
 // tabs
 const panels={folders:$('#folders'),sessions:$('#sessions'),settings:$('#settings')};
