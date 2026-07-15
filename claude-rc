@@ -356,7 +356,7 @@ cmd_start() {
       tm respawn-window -k -t "$target" -c "$dir" "$rc_cmd"
       echo "${C_GREEN}再起動:${C_RESET} $name"
     else
-      tm new-window -t "$TMUX_SESSION" -n "$name" -c "$dir" "$rc_cmd"
+      tm new-window -t "$TMUX_SESSION:" -n "$name" -c "$dir" "$rc_cmd"
       echo "${C_GREEN}起動:${C_RESET}   $name  ${C_DIM}($dir)${C_RESET}"
     fi
     started=$((started + 1))
@@ -605,7 +605,7 @@ _rc_start_dir() {
   if window_exists "$name"; then
     tm respawn-window -k -t "$TMUX_SESSION:$name" -c "$dir" "$rc_cmd"; echo "${C_GREEN}再起動:${C_RESET} $name"
   else
-    tm new-window -t "$TMUX_SESSION" -n "$name" -c "$dir" "$rc_cmd"; echo "${C_GREEN}起動:${C_RESET}   $name"
+    tm new-window -t "$TMUX_SESSION:" -n "$name" -c "$dir" "$rc_cmd"; echo "${C_GREEN}起動:${C_RESET}   $name"
   fi
   if window_exists "__base__" && [ "$(tm list-windows -t "$TMUX_SESSION" | wc -l)" -gt 1 ]; then
     tm kill-window -t "$TMUX_SESSION:__base__" 2>/dev/null || true
@@ -712,7 +712,7 @@ cmd_session_on() {
   rc_cmd="'$CLAUDE_BIN' --resume '$sid' --remote-control --name '$label'"
   [ -n "${RC_PERMISSION_MODE:-}" ] && rc_cmd="$rc_cmd --permission-mode '$RC_PERMISSION_MODE'"
   if window_exists "$win"; then tm respawn-window -k -t "$TMUX_SESSION:$win" -c "$dir" "$rc_cmd"
-  else tm new-window -t "$TMUX_SESSION" -n "$win" -c "$dir" "$rc_cmd"; fi
+  else tm new-window -t "$TMUX_SESSION:" -n "$win" -c "$dir" "$rc_cmd"; fi
   # resume のコスト確認プロンプトが出たら自動選択。無ければ何もしない（誤入力防止に検出ベース）。
   local i pane
   for i in 1 2 3 4 5 6 7 8 9 10; do
